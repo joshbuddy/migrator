@@ -10,11 +10,51 @@ import (
 
 const defaultTableName = "migrations"
 
+type Tx interface {
+	Rollback() error
+	Commit() error
+	Exec(string) (sql.Result, error)
+	Tx() *sql.Tx
+}
+
+type TransactionMaker func(db *sql.DB) (Tx, error)
+
+func defaultTransactionMaker() TransactionMaker {
+	return func(db *sql.DB) (Tx, error) {
+		tx, err := db.Begin()
+		if err != nil {
+			return nil, err
+		}
+		return &txWrapper{tx}, nil
+	}
+}
+
+type txWrapper struct {
+	tx *sql.Tx
+}
+
+func (w *txWrapper) Rollback() error {
+	return w.tx.Rollback()
+}
+
+func (w *txWrapper) Commit() error {
+	return w.tx.Commit()
+}
+
+func (w *txWrapper) Exec(s string) (sql.Result, error) {
+	return w.tx.Exec(s)
+}
+
+func (w *txWrapper) Tx() *sql.Tx {
+	return w.tx
+}
+
 // Migrator is the migrator implementation
 type Migrator struct {
-	tableName  string
-	logger     Logger
-	migrations []interface{}
+	tableName        string
+	logger           Logger
+	migrations       []interface{}
+	transactionMaker TransactionMaker
 }
 
 // Option sets options such migrations or table name.
@@ -47,6 +87,13 @@ func WithLogger(logger Logger) Option {
 	}
 }
 
+// WithLogger creates an option to allow overriding the stdout logging
+func WithTransactionMaker(tm TransactionMaker) Option {
+	return func(m *Migrator) {
+		m.transactionMaker = tm
+	}
+}
+
 // Migrations creates an option with provided migrations
 func Migrations(migrations ...interface{}) Option {
 	return func(m *Migrator) {
@@ -57,8 +104,9 @@ func Migrations(migrations ...interface{}) Option {
 // New creates a new migrator instance
 func New(opts ...Option) (*Migrator, error) {
 	m := &Migrator{
-		logger:    log.New(os.Stdout, "migrator: ", 0),
-		tableName: defaultTableName,
+		logger:           log.New(os.Stdout, "migrator: ", 0),
+		tableName:        defaultTableName,
+		transactionMaker: defaultTransactionMaker(),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -109,7 +157,7 @@ func (m *Migrator) Migrate(db *sql.DB) error {
 		insertVersion := fmt.Sprintf("INSERT INTO %s (id, version) VALUES (%d, '%s')", m.tableName, idx+count, migration.(fmt.Stringer).String())
 		switch mig := migration.(type) {
 		case *Migration:
-			if err := migrate(db, m.logger, insertVersion, mig); err != nil {
+			if err := migrate(db, m.transactionMaker, m.logger, insertVersion, mig); err != nil {
 				return fmt.Errorf("migrator: error while running migrations: %v", err)
 			}
 		case *MigrationNoTx:
@@ -173,8 +221,8 @@ func (m *MigrationNoTx) String() string {
 	return m.Name
 }
 
-func migrate(db *sql.DB, logger Logger, insertVersion string, migration *Migration) error {
-	tx, err := db.Begin()
+func migrate(db *sql.DB, tm TransactionMaker, logger Logger, insertVersion string, migration *Migration) error {
+	tx, err := tm(db)
 	if err != nil {
 		return err
 	}
@@ -188,7 +236,7 @@ func migrate(db *sql.DB, logger Logger, insertVersion string, migration *Migrati
 		err = tx.Commit()
 	}()
 	logger.Printf("applying migration named '%s'...", migration.Name)
-	if err = migration.Func(tx); err != nil {
+	if err = migration.Func(tx.Tx()); err != nil {
 		return fmt.Errorf("error executing golang migration: %s", err)
 	}
 	if _, err = tx.Exec(insertVersion); err != nil {
